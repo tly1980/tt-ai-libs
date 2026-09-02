@@ -39,56 +39,24 @@ workspaces/
 
 ---
 
-## Setup Commands
+## Setup
 
-```bash
-# create the main clone
-mkdir -p workspaces/aaa
-cd workspaces/aaa
-git clone git@github.com:yourorg/aaa.git main
+1. Create the repo folder and clone into `main/`:
+   ```
+   git clone git@github.com:yourorg/<repo>.git workspaces/<repo>/main
+   ```
+2. From `main/`, add a worktree for the new branch:
+   ```
+   git worktree add ../<branch> -b <branch>
+   ```
+3. Inside the new worktree: copy `.env` from `main/` if one exists, run the project's dependency install (e.g. `uv sync`), and assign a unique port before starting any dev server.
 
-# create a worktree for a new feature branch
-cd main
-git worktree add ../feat-login-fix -b feat-login-fix
-```
+## Cleanup (after a branch is merged)
 
-## Helper Scripts
-
-**`new-worktree.sh <repo> <branch>`**
-```bash
-#!/usr/bin/env bash
-repo=$1
-branch=$2
-cd "workspaces/$repo/main" || exit 1
-git worktree add "../$branch" -b "$branch"
-cd "../$branch"
-[ -f ../main/.env ] && cp ../main/.env .env
-uv sync
-echo "Worktree ready at workspaces/$repo/$branch — remember to set a unique PORT"
-```
-
-**`cleanup-merged.sh <repo>`**
-```bash
-#!/usr/bin/env bash
-set -e
-repo=$1
-cd "workspaces/$repo/main"
-
-git checkout main
-git pull
-git fetch --prune
-
-gone=$(git branch -vv | grep ': gone]' | awk '{print $1}')
-
-for branch in $gone; do
-  wt="../$branch"
-  [ -d "$wt" ] && git worktree remove "$wt" --force
-  git branch -D "$branch"
-done
-
-git worktree prune
-echo "Cleanup complete for $repo"
-```
+1. In `main/`, switch to the default branch, `git pull`, then `git fetch --prune`.
+2. Find local branches whose upstream is gone: `git branch -vv | grep ': gone]'`.
+3. For each: `git worktree remove ../<branch> --force`, then `git branch -D <branch>` (force delete — see gotcha below on squash merges).
+4. Run `git worktree prune` to clear any stale registrations.
 
 ---
 
@@ -101,7 +69,7 @@ Worker codes, commits, pushes, reports "done", exits
       → Manager opens PR, reviews diff + CI
       → Rework needed? Respawn a new worker into the SAME worktree with feedback
       → Approved? Merge (human-gated recommended initially)
-Manager runs cleanup-merged.sh once merge is confirmed
+Manager runs cleanup once merge is confirmed
       → worktree removed, branch deleted, state file updated
 ```
 
