@@ -93,6 +93,101 @@ The ruff and mypy config lives in `pyproject.toml` — see
 - `logging` module, one `logger = logging.getLogger(__name__)` per module. Never
   `print()` outside a CLI's own output.
 - Use lazy log formatting: `logger.info("loaded %s rows", n)` — not an f-string.
+- Use `logger.exception("...")` inside an `except` block — it keeps the
+  traceback. `logger.error(str(e))` throws it away.
+- Configure logging **only at the entrypoint** — `main()`, a service startup
+  hook, a `conftest.py` fixture. A library that calls `basicConfig` or
+  `addHandler` at import time steals the application's configuration.
+
+### Log Format
+
+One line per event, on stderr, with the variable parts passed through `extra=`
+rather than baked into the message. Text for humans, JSON for aggregators —
+the entrypoint picks between them from `LOG_FORMAT` (`text` by default, `json`
+for services), never a code path.
+
+**Text** — the default for CLIs, libraries and local development:
+
+```python
+LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    datefmt=LOG_DATEFMT,
+    stream=sys.stderr,
+)
+```
+
+```
+2026-09-10T14:22:31+0000 INFO     my_tool.loader: loaded 1432 rows
+2026-09-10T14:22:31+0000 WARNING  my_tool.api: retrying after 429
+```
+
+- ISO-8601 with offset, not the stdlib default `2026-09-10 14:22:31,123` — it
+  sorts lexicographically and every log tool parses it. Set
+  `logging.Formatter.converter = time.gmtime` to force UTC regardless of host.
+- `%(name)s`, not `%(module)s` — with `getLogger(__name__)` the logger name is
+  already the dotted module path.
+- `%(levelname)-8s` padded, so the level column lines up when scanning.
+- stderr, so a CLI's own output on stdout stays pipeable.
+- No `%(filename)s:%(lineno)d` in the default format. It is noise at INFO, and
+  when you need it you are reading a traceback that already has it — put it in
+  the `--debug` format instead.
+
+**JSON** — for services and anything shipping to a log aggregator:
+
+```python
+_RESERVED = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
+_RESERVED |= {"message", "asctime"}
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line; anything passed via extra= becomes a field."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": dt.datetime.fromtimestamp(record.created, dt.UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        context = {k: v for k, v in record.__dict__.items() if k not in _RESERVED}
+        payload.update(context)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+```
+
+Keeping the message a constant and putting the variables in `extra=` is what
+makes the JSON worth having — one event stays one group in the aggregator, and
+the fields stay faceted:
+
+```python
+# no — context welded into the message, ungreppable, unaggregatable
+logger.info("order %s for customer %s failed after %s retries", oid, cid, n)
+
+# yes — message is a constant, context is structured
+logger.info("order failed", extra={"order_id": oid, "customer_id": cid, "retries": n})
+```
+
+Lazy `%s` formatting still applies to whatever does stay in the message.
+
+Beyond the format itself:
+
+- Everything passed through `extra=` lands in the log verbatim — [Secrets](#secrets)
+  applies to those fields exactly as it does to the message.
+- One event per line. Never a multi-line log message — it breaks every
+  line-oriented tool downstream. Tracebacks are the exception, and
+  `exc_info=True` handles those.
+- Levels: `DEBUG` dev-only, `INFO` for state changes worth an audit trail,
+  `WARNING` for recovered degradation, `ERROR` for work that was dropped.
+- Pin third-party loggers to `WARNING` explicitly — `botocore` and `urllib3`
+  at INFO will bury your own lines.
+- No `structlog`. Every library you depend on logs through stdlib `logging`, so
+  a second logging API means bridging anyway. The formatter above gets the same
+  structured output with no new dependency and no second mental model.
 
 ## Secrets
 
