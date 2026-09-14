@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# wt — git worktree helper implementing tt-ai-libs/git-worktree-workflow.md
+#
+# Layout:  <root>/<repo>/main  +  <root>/<repo>/<branch>  (folder == branch)
+# State:   <root>/<repo>/.worktree-ports.json   {"<branch>": <port>}
+#
+# Usage:
+#   wt create  <branch> [--repo <path>] [--from <ref>] [--url <git-url>] [--no-install]
+#   wt cleanup [--repo <path>] [--dry-run] [--yes]
+#   wt list    [--repo <path>]
+#   wt status  [--repo <path>] <branch>
+#
+# --repo may point at main/, any worktree, or the <repo>/ folder. Defaults to $PWD.
+# All output is terse and machine-readable on purpose: the caller is an LLM.
+set -euo pipefail
+
+BASE_PORT=${WT_BASE_PORT:-8100}
+PORTS_FILE=.worktree-ports.json
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+note() { echo "$*"; }
+
+# ---- locate <repo>/main from any path inside the layout ----------------------
+find_main() {
+  local p; p=$(cd "${1:-$PWD}" 2>/dev/null && pwd) || die "no such path: $1"
+  if [[ -d $p/main/.git ]]; then echo "$p/main"; return; fi
+  # walk up: inside main/ or a worktree -> git toplevel, then check sibling main/
+  local top; top=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout: $p"
+  if [[ $(basename "$top") == main ]]; then echo "$top"; return; fi
+  [[ -d $(dirname "$top")/main/.git ]] && { echo "$(dirname "$top")/main"; return; }
+  die "cannot find <repo>/main from $p (layout must be <repo>/main + <repo>/<branch>)"
+}
+
+default_branch() {
+  git -C "$1" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' \
+    || git -C "$1" rev-parse --abbrev-ref HEAD
+}
+
+flatten() { echo "${1//\//-}"; }
+
+# ---- ports -------------------------------------------------------------------
+next_port() {
+  local f=$1 p=$BASE_PORT used
+  [[ -f $f ]] || echo '{}' >"$f"
+  used=$(jq -r 'to_entries[].value' "$f")
+  while grep -qx "$p" <<<"$used" || (command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$p "); do p=$((p+1)); done
+  echo "$p"
+}
+set_port() { local f=$1 b=$2 p=$3 t; t=$(jq --arg b "$b" --argjson p "$p" '.[$b]=$p' "$f"); echo "$t" >"$f"; }
+del_port() { local f=$1 b=$2 t; [[ -f $f ]] || return 0; t=$(jq --arg b "$b" 'del(.[$b])' "$f"); echo "$t" >"$f"; }
+get_port() { [[ -f $1 ]] && jq -r --arg b "$2" '.[$b] // empty' "$1"; }
+
+# ---- commands ----------------------------------------------------------------
+cmd_create() {
+  local branch="" repo="$PWD" from="" url="" install=1
+  while [[ $# -gt 0 ]]; do case $1 in
+    --repo) repo=$2; shift 2;; --from) from=$2; shift 2;; --url) url=$2; shift 2;;
+    --no-install) install=0; shift;; -*) die "unknown flag $1";; *) branch=$1; shift;; esac; done
+  [[ -n $branch ]] || die "usage: wt create <branch> [--repo <path>] [--from <ref>] [--url <git-url>]"
+
+  local main
+  if [[ -n $url ]]; then
+    main=$repo/$(basename "${url%.git}")/main
+    [[ -d $main ]] || git clone -q "$url" "$main"
+  else
+    main=$(find_main "$repo")
+  fi
+  local root; root=$(dirname "$main")
+  local folder; folder=$(flatten "$branch")
+  local wt=$root/$folder
+
+  [[ -e $wt ]] && die "already exists: $wt"
+  [[ -z $(git -C "$main" status --porcelain) ]] || die "main/ has uncommitted changes — resolve before creating worktrees"
+  git -C "$main" fetch -q --prune origin
+
+  local kind
+  if git -C "$main" show-ref -q --verify "refs/heads/$branch"; then
+    kind=local;  git -C "$main" worktree add -q "$wt" "$branch"
+  elif git -C "$main" show-ref -q --verify "refs/remotes/origin/$branch"; then
+    kind=remote; git -C "$main" worktree add -q "$wt" -b "$branch" "origin/$branch"
+  else
+    kind=new;    git -C "$main" worktree add -q "$wt" -b "$branch" "${from:-origin/$(default_branch "$main")}"
+  fi
+
+  local env=no; [[ -f $main/.env ]] && { cp "$main/.env" "$wt/.env"; env=yes; }
+
+  local port; port=$(next_port "$root/$PORTS_FILE"); set_port "$root/$PORTS_FILE" "$branch" "$port"
+  grep -q '^PORT=' "$wt/.env" 2>/dev/null && sed -i "s/^PORT=.*/PORT=$port/" "$wt/.env" || echo "PORT=$port" >>"$wt/.env"
+
+  local deps=skipped
+  if (( install )); then
+    if   [[ -f $wt/uv.lock || -f $wt/pyproject.toml ]]; then (cd "$wt" && uv sync -q) && deps=ok || deps=FAILED
+    elif [[ -f $wt/package-lock.json ]]; then (cd "$wt" && npm ci --silent) && deps=ok || deps=FAILED
+    elif [[ -f $wt/Cargo.toml ]]; then (cd "$wt" && cargo fetch -q) && deps=ok || deps=FAILED
+    else deps=none; fi
+  fi
+
+  cat <<R
+worktree=$wt
+branch=$branch ($kind)
+folder_flattened=$([[ $folder == "$branch" ]] && echo no || echo yes)
+base=$(git -C "$wt" rev-parse --short HEAD)
+port=$port
+env_copied=$env
+deps=$deps
+R
+}
+
+# ignore artefacts that `wt create` itself produces
+dirty_count() { git -C "$1" status --porcelain | grep -vE '^(.. \.env|\?\? \.venv/|\?\? uv\.lock)$' | wc -l || true; }
+
+# 1 if a merged PR exists for the branch (GitHub via gh), else 0
+pr_merged() {
+  command -v gh >/dev/null || return 1
+  [[ $(git -C "$1" -c core.pager=cat ls-remote --get-url origin) == *github.com* ]] || return 1
+  [[ $(gh pr list --repo "$(git -C "$1" ls-remote --get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')" \
+        --state merged --head "$2" --json number -q length 2>/dev/null) -gt 0 ]]
+}
+
+cmd_cleanup() {
+  local repo="$PWD" dry=0 yes=0
+  while [[ $# -gt 0 ]]; do case $1 in
+    --repo) repo=$2; shift 2;; --dry-run) dry=1; shift;; --yes) yes=1; shift;; *) die "unknown flag $1";; esac; done
+  local main; main=$(find_main "$repo"); local root; root=$(dirname "$main")
+  local def; def=$(default_branch "$main")
+
+  [[ -z $(git -C "$main" status --porcelain) ]] || die "main/ has uncommitted changes"
+  git -C "$main" checkout -q "$def" && git -C "$main" pull -q --ff-only
+
+  # Snapshot upstream tips before --prune removes them (only helps if the remote
+  # branch was deleted elsewhere; `git push --delete` from here drops the ref at once).
+  declare -A uptip
+  local b u
+  while read -r b u; do [[ -n $u ]] && uptip[$b]=$(git -C "$main" rev-parse -q --verify "$u" 2>/dev/null || true); done \
+    < <(git -C "$main" for-each-ref --format='%(refname:short) %(upstream:short)' refs/heads)
+  git -C "$main" fetch -q --prune origin
+
+  local gone; gone=$(git -C "$main" branch -vv --format='%(refname:short) %(upstream:track)' | awk '$2=="[gone]"{print $1}')
+  [[ -n $gone ]] || { note "nothing to clean"; git -C "$main" worktree prune; return; }
+
+  local wt
+  for b in $gone; do
+    wt=$root/$(flatten "$b")
+    local dirty=0; [[ -d $wt ]] && dirty=$(dirty_count "$wt")
+    # unmerged = commits on the branch not known to be merged. Trust a merged PR
+    # first (squash merges leave no ancestry); else compare to the old upstream tip;
+    # else fall back to commits not on the default branch (noisy for squash merges).
+    local unmerged=0 how
+    if pr_merged "$main" "$b"; then how=pr-merged
+    elif [[ -n ${uptip[$b]:-} ]]; then how=vs-upstream; unmerged=$(git -C "$main" rev-list --count "${uptip[$b]}..$b")
+    else how=vs-$def; unmerged=$(git -C "$main" rev-list --count "origin/$def..$b"); fi
+    if (( dirty || unmerged )) && (( ! yes )); then
+      note "SKIP $b: dirty=$dirty unmerged=$unmerged ($how) (re-run with --yes to discard)"; continue
+    fi
+    if (( dry )); then note "WOULD remove $b ($wt)"; continue; fi
+    [[ -d $wt ]] && git -C "$main" worktree remove --force "$wt"
+    git -C "$main" branch -q -D "$b"
+    del_port "$root/$PORTS_FILE" "$b"
+    note "removed $b"
+  done
+  git -C "$main" worktree prune
+}
+
+cmd_list() {
+  local repo="$PWD"; [[ ${1:-} == --repo ]] && repo=$2
+  local main; main=$(find_main "$repo"); local root; root=$(dirname "$main")
+  git -C "$main" worktree list --porcelain | awk '/^worktree /{w=$2} /^branch /{sub("refs/heads/","",$2); print w, $2}' | while read -r w b; do
+    echo "$w  branch=$b  port=$(get_port "$root/$PORTS_FILE" "$b")"
+  done
+}
+
+cmd_status() {
+  local repo="$PWD" branch=""
+  while [[ $# -gt 0 ]]; do case $1 in --repo) repo=$2; shift 2;; *) branch=$1; shift;; esac; done
+  [[ -n $branch ]] || die "usage: wt status <branch>"
+  local main; main=$(find_main "$repo"); local wt; wt=$(dirname "$main")/$(flatten "$branch")
+  [[ -d $wt ]] || die "no worktree for $branch"
+  echo "worktree=$wt"
+  echo "head=$(git -C "$wt" rev-parse --short HEAD)"
+  echo "dirty=$(dirty_count "$wt")"
+  local up; up=$(git -C "$wt" rev-parse -q --verify '@{u}' 2>/dev/null) && echo "unpushed=$(git -C "$wt" rev-list --count '@{u}..')" || echo "unpushed=n/a (no upstream)"
+  echo "port=$(get_port "$(dirname "$main")/$PORTS_FILE" "$branch")"
+}
+
+case ${1:-} in
+  create)  shift; cmd_create "$@";;
+  cleanup) shift; cmd_cleanup "$@";;
+  list)    shift; cmd_list "$@";;
+  status)  shift; cmd_status "$@";;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1;;
+esac
