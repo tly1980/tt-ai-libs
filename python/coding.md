@@ -93,6 +93,7 @@ The ruff and mypy config lives in `pyproject.toml` — see
 - `logging` module, one `logger = logging.getLogger(__name__)` per module. Never
   `print()` outside a CLI's own output.
 - Use lazy log formatting: `logger.info("loaded %s rows", n)` — not an f-string.
+
 - Use `logger.exception("...")` inside an `except` block — it keeps the
   traceback. `logger.error(str(e))` throws it away.
 - Configure logging **only at the entrypoint** — `main()`, a service startup
